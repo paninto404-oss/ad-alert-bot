@@ -64,19 +64,26 @@ def get_klines(symbol, interval=INTERVAL, limit=30):
         return None
 
 
-def calculate_ad_score(df):
-    if df is None or len(df) < 15:
-        return 0
+def calculate_ad_score(df, length=10):
+    """Advance/Decline Ratio по свечам (как индикатор AD 10 на Coinglass):
+    число растущих свечей / число падающих свечей за последние 10 свечей.
+    Возвращает (ratio, up, down) или None, если данных нет."""
+    if df is None or len(df) < length:
+        return None
+    last = df.tail(length)
+    up = int((last["close"] > last["open"]).sum())
+    down = int((last["close"] < last["open"]).sum())
+    if down == 0:
+        ratio = float("inf") if up > 0 else 0.0
+    else:
+        ratio = round(up / down, 2)
+    return ratio, up, down
 
-    mf = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / (df["high"] - df["low"] + 1e-8)
-    mf = mf.fillna(0)
-    mfv = mf * df["volume"]
-    ad = mfv.cumsum()
-    recent = ad.tail(10)
-    if recent.max() == recent.min():
-        return 5.0
-    score = ((recent.iloc[-1] - recent.min()) / (recent.max() - recent.min())) * 10
-    return round(score, 2)
+
+def fmt_score(result):
+    ratio, up, down = result
+    shown = "∞" if ratio == float("inf") else ratio
+    return f"AD {shown} ({up} вверх / {down} вниз)"
 
 
 # === МОНИТОРИНГ (работает в фоновом потоке) ===
@@ -100,14 +107,17 @@ def monitor_loop():
                 if df is None:
                     continue
 
-                score = calculate_ad_score(df)
+                result = calculate_ad_score(df)
+                if result is None:
+                    continue
+                score = result[0]
 
                 if score >= THRESHOLD:
                     now = time.time()
                     if symbol not in last_alert or now - last_alert[symbol] > 900:
-                        send_telegram(f"{symbol}")
+                        send_telegram(f"{symbol}: {fmt_score(result)}")
                         state["alerts_sent"] += 1
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Алерт: {symbol} | Score: {score}")
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Алерт: {symbol} | {fmt_score(result)}")
                         last_alert[symbol] = now
 
                 time.sleep(0.3)
@@ -161,11 +171,11 @@ def handle_command(text, chat_id):
             send_telegram("Укажи пару, например: /score BTCUSDT", chat_id)
             return
         symbol = args[0].upper()
-        df = get_klines(symbol)
-        if df is None:
+        result = calculate_ad_score(get_klines(symbol))
+        if result is None:
             send_telegram(f"Не удалось получить данные по {symbol}", chat_id)
             return
-        send_telegram(f"{symbol}: score {calculate_ad_score(df)} (порог {THRESHOLD})", chat_id)
+        send_telegram(f"{symbol}: {fmt_score(result)} (порог {THRESHOLD})", chat_id)
 
     elif cmd == "/pause":
         state["paused"] = True
