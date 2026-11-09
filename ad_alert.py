@@ -200,12 +200,19 @@ def check_symbol(symbol):
     # Зелёная CVD-свеча = дельта больше нуля.
     delta = 2 * float(last["taker_buy_quote"]) - float(last["quote_volume"])
     drop = first_drop_at_last(series)
+    # Индикатор Volume: красный столбец = свеча закрылась ниже открытия,
+    # и объём этой свечи больше объёма предыдущей.
+    prev_candle = df.iloc[-2]
+    vol_red = float(last["close"]) < float(last["open"])
+    vol_higher = float(last["volume"]) > float(prev_candle["volume"])
     return symbol, {
         "prev": series[-2],
         "cur": series[-1],
         "drop": drop,
         "delta": delta,
-        "signal": drop and delta > 0,
+        "vol_red": vol_red,
+        "vol_higher": vol_higher,
+        "signal": drop and delta > 0 and vol_red and vol_higher,
         "candle": int(last["open_time"]),
     }
 
@@ -258,11 +265,11 @@ def monitor_loop():
                     continue
                 if info["signal"] and alerted.get(symbol) != info["candle"]:
                     alerted[symbol] = info["candle"]
-                    alerts.append(f"{symbol} (AD {fmt_num(info['prev'])} → {fmt_num(info['cur'])})")
+                    alerts.append(symbol)
 
             if alerts:
                 state["alerts_sent"] += len(alerts)
-                send_long("Сигнал (AD пошёл вниз после 8+, CVD-свеча зелёная):\n" + "\n".join(alerts))
+                send_long("\n".join(alerts))
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Сигналов: {len(alerts)}")
 
             state["last_check"] = datetime.now().strftime("%H:%M:%S")
@@ -292,8 +299,9 @@ def handle_command(text, chat_id):
 
     if cmd in ("/start", "/help"):
         send_telegram(
-            "Привет! Я присылаю сигнал, когда Advance/Decline Ratio (AD 10) после уровня "
-            f"{THRESHOLD:g}+ впервые идёт вниз, а CVD-свеча на этой же свече зелёная.\n\n" + HELP_TEXT,
+            "Привет! Я присылаю название пары, когда Advance/Decline Ratio (AD 10) после уровня "
+            f"{THRESHOLD:g}+ впервые идёт вниз, CVD-свеча на этой же свече зелёная, "
+            "а столбец Volume красный и выше предыдущего.\n\n" + HELP_TEXT,
             chat_id,
         )
 
@@ -326,6 +334,8 @@ def handle_command(text, chat_id):
             f"AD: {fmt_num(info['prev'])} → {fmt_num(info['cur'])}\n"
             f"Первое падение после {THRESHOLD:g}+: {'да' if info['drop'] else 'нет'}\n"
             f"CVD-свеча: {'зелёная' if info['delta'] > 0 else 'красная'} (дельта {info['delta']:,.0f} USDT)\n"
+            f"Volume: {'красный' if info['vol_red'] else 'зелёный'}, "
+            f"{'выше' if info['vol_higher'] else 'не выше'} предыдущего\n"
             f"Сигнал: {'ДА' if info['signal'] else 'нет'}",
             chat_id,
         )
@@ -374,4 +384,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
