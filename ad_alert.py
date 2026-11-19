@@ -1,459 +1,516 @@
-import os
-import time
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ad_alert.py - Telegram-бот: сигналы по Binance USDT-M Futures, таймфрейм 3m.
 
-import pandas as pd
+Сигнал приходит, когда на только что ЗАКРЫТОЙ 3m-свече (сигнальной) выполнено всё:
+  1. AD 10 (отношение растущих свечей к падающим за 10 свечей) на предыдущей свече
+     было >= 8 (бесконечность тоже считается), а на сигнальной свече упало ниже.
+  2. CVD зелёный: дельта сигнальной свечи > 0 (покупки taker - продажи taker).
+  3. Volume: сигнальная свеча красная, её объём больше объёма предсигнальной свечи.
+  4. Balance of Power (BoP) сигнальной свечи:
+       BoP <= -0.4  -> в сигнале "ШОРТ"
+       BoP >  -0.1  -> в сигнале "ВВЕРХ"
+       между -0.4 и -0.1 -> сигнал НЕ отправляется
+     BoP = (close - open) / (high - low)
+
+Переменные окружения (Railway -> Variables):
+  BOT_TOKEN, CHAT_ID  - обязательные
+  MAX_PAIRS           - сколько пар смотреть (по умолчанию 400, 0 = все подходящие)
+  MIN_RANGE_PCT       - отсев "неволатильных": дневной размах (high-low)/low в %, по умолчанию 1.0
+  EXCLUDE             - доп. исключения через запятую, например "BTCDOMUSDT,USDCUSDT"
+  AD_THRESHOLD, BOP_SHORT, BOP_UP, AD_PERIOD - пороги (8, -0.4, -0.1, 10)
+  ALERT_DETAILS       - 1: добавлять в сигнал значения AD и BoP (по умолчанию 0: только пара и направление)
+  BINANCE_URL         - по умолчанию https://fapi.binance.com
+"""
+
+import json
+import logging
+import math
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
 
-# === НАСТРОЙКИ ===
-# Токен берётся из переменной окружения BOT_TOKEN (Railway -> Variables)
-TELEGRAM_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = int(os.environ.get("CHAT_ID", "347263656"))
-
-# Ваши пары (проверяются всегда)
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "NEARUSDT", "AAVEUSDT", "ZROUSDT", "1000FLOKIUSDT",
-    "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT",
-    "DOTUSDT", "SUIUSDT", "LTCUSDT", "APTUSDT", "ENAUSDT", "UNIUSDT",
-    "ATOMUSDT", "ARBUSDT", "STRKUSDT", "1000PEPEUSDT", "LDOUSDT", "XLMUSDT",
-    "WLDUSDT", "TRXUSDT", "OPUSDT", "ICPUSDT", "DASHUSDT", "HBARUSDT",
-    "FILUSDT", "BCHUSDT", "ETCUSDT", "TWTUSDT", "DYDXUSDT", "INJUSDT",
-    "CRVUSDT", "BOMEUSDT", "TAOUSDT", "TRUMPUSDT", "ZKUSDT", "FETUSDT",
-    "ALGOUSDT", "CAKEUSDT", "TIAUSDT", "NOTUSDT", "ZECUSDT"
-]
+# ----------------------------------------------------------------------------
+# Настройки
+# ----------------------------------------------------------------------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = str(os.environ.get("CHAT_ID", ""))
+BINANCE_URL = os.environ.get("BINANCE_URL", "https://fapi.binance.com").rstrip("/")
 
 INTERVAL = "3m"
-LOCAL_UTC_OFFSET = 3   # ваш часовой пояс (UTC+3), нужен только для команды /check ПАРА ЧЧ:ММ
-CHECK_INTERVAL = 180   # длина свечи в секундах (3 минуты)
-THRESHOLD = 8.0        # уровень Advance/Decline Ratio
-AD_MODE = "open"       # "open": свеча растёт, если close > open; "prev_close": если close выше закрытия предыдущей свечи
-CANDLE_DELAY = 5       # секунд ожидания после закрытия свечи, чтобы Binance её зафиксировал
+INTERVAL_MS = 180_000
 
-# Автоматическое добавление пар с Binance Futures
-AUTO_ADD_PAIRS = True
-MAX_PAIRS = 400               # общее число пар (ваши + добавленные)
-MIN_DAILY_RANGE_PCT = 1.5     # не брать пары, у которых размах цены за 24ч меньше этого процента
-STABLE_BASES = {"USDC", "FDUSD", "TUSD", "USDP", "BUSD", "DAI", "USDE", "USD1", "AEUR", "EURI", "EUR"}
-WORKERS = 10                  # сколько пар проверять параллельно
-REFRESH_EVERY = 60            # обновлять список пар каждые N свечей (60 = раз в 3 часа)
+AD_PERIOD = int(os.environ.get("AD_PERIOD", "10"))
+AD_THRESHOLD = float(os.environ.get("AD_THRESHOLD", "8"))
+BOP_SHORT = float(os.environ.get("BOP_SHORT", "-0.4"))
+BOP_UP = float(os.environ.get("BOP_UP", "-0.1"))
 
-API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+MAX_PAIRS = int(os.environ.get("MAX_PAIRS", "400"))
+MIN_RANGE_PCT = float(os.environ.get("MIN_RANGE_PCT", "1.0"))
+PAIRS_REFRESH_SEC = int(os.environ.get("PAIRS_REFRESH_SEC", str(6 * 3600)))
+WORKERS = int(os.environ.get("WORKERS", "16"))
+CYCLE_DELAY_SEC = float(os.environ.get("CYCLE_DELAY_SEC", "4"))
+ALERT_DETAILS = os.environ.get("ALERT_DETAILS", "0") == "1"
 
-# Общее состояние между мониторингом и командами
-state = {"paused": False, "last_check": None, "alerts_sent": 0, "symbols": list(SYMBOLS)}
+# Нужно AD_PERIOD+1 закрытых свечей (AD на предсигнальной и на сигнальной) + запас.
+# limit < 100 у Binance = вес запроса 1.
+KLINES_LIMIT = AD_PERIOD + 6
+
+# Стейблы и подобное: не волатильные, отсекаем по базовому активу.
+EXCLUDE_BASES = {
+    "USDC", "FDUSD", "TUSD", "BUSD", "USDP", "DAI", "USDE", "EUR", "AEUR",
+    "XUSD", "USD1", "RLUSD", "USDS", "PYUSD", "UST", "USTC",
+}
+EXTRA_EXCLUDE = {s.strip().upper() for s in os.environ.get("EXCLUDE", "").split(",") if s.strip()}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("ad_alert")
+
+# ----------------------------------------------------------------------------
+# Общее состояние
+# ----------------------------------------------------------------------------
+_lock = threading.Lock()
+STATE = {
+    "pairs": [],
+    "pairs_updated": 0.0,
+    "paused": False,
+    "last_cycle_ts": 0.0,
+    "last_cycle_sec": 0.0,
+    "last_cycle_ok": 0,
+    "last_cycle_err": 0,
+    "sent_total": 0,
+    "latest": {},       # symbol -> результат evaluate() по последней закрытой свече
+    "last_sent": {},    # symbol -> open_time сигнальной свечи, по которой уже слали
+}
+
+_tls = threading.local()
+_rate_until = 0.0  # если Binance просит подождать (429/418)
 
 
-# === TELEGRAM ===
-def send_telegram(message, chat_id=CHAT_ID):
-    try:
-        requests.post(
-            f"{API}/sendMessage",
-            json={"chat_id": chat_id, "text": message},
-            timeout=10,
+class BinanceError(Exception):
+    pass
+
+
+def _session():
+    s = getattr(_tls, "s", None)
+    if s is None:
+        s = requests.Session()
+        _tls.s = s
+    return s
+
+
+def binance_get(path, params=None):
+    global _rate_until
+    wait = _rate_until - time.time()
+    if wait > 0:
+        time.sleep(min(wait, 60))
+    r = _session().get(BINANCE_URL + path, params=params, timeout=10)
+    if r.status_code in (418, 429):
+        retry = int(r.headers.get("Retry-After", "10"))
+        _rate_until = time.time() + retry
+        raise BinanceError("лимит запросов Binance (HTTP %s), пауза %s c" % (r.status_code, retry))
+    if r.status_code in (403, 451):
+        raise BinanceError(
+            "HTTP %s: Binance закрыт для региона сервера. Смените регион в Railway (не US)." % r.status_code
         )
-    except Exception as e:
-        print("Ошибка отправки в Telegram:", e)
+    r.raise_for_status()
+    return r.json()
 
 
-def send_long(text, chat_id=CHAT_ID, limit=3500):
-    """Отправляет длинный текст частями (лимит Telegram около 4096 символов)."""
-    while text:
-        if len(text) <= limit:
-            send_telegram(text, chat_id)
-            break
-        cut = text.rfind("\n", 0, limit)
-        if cut == -1:
-            cut = text.rfind(", ", 0, limit)
-        if cut == -1:
-            cut = limit
-        send_telegram(text[:cut], chat_id)
-        text = text[cut:].lstrip(", \n")
+# ----------------------------------------------------------------------------
+# Telegram
+# ----------------------------------------------------------------------------
+def tg_api(method, **params):
+    url = "https://api.telegram.org/bot%s/%s" % (BOT_TOKEN, method)
+    r = requests.post(url, data=params, timeout=40)
+    return r.json()
 
 
-# === ДАННЫЕ ===
-def get_klines(symbol, interval=INTERVAL, limit=40, end_time=None):
-    url = "https://fapi.binance.com/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    if end_time:
-        params["endTime"] = end_time
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        if not isinstance(data, list):
-            print(f"Binance вернул ошибку для {symbol}:", data)
-            return None
-        df = pd.DataFrame(data, columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trades", "taker_buy_base",
-            "taker_buy_quote", "ignore"
-        ])
-        for col in ["open", "high", "low", "close", "volume", "quote_volume", "taker_buy_quote"]:
-            df[col] = df[col].astype(float)
-        return df
-    except Exception as e:
-        print(f"Ошибка получения данных {symbol}:", e)
-        return None
+def send(text, chat_id=None):
+    chat_id = chat_id or CHAT_ID
+    # Telegram: максимум 4096 символов на сообщение
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        chunks.append(cur)
+    for chunk in chunks:
+        for attempt in range(3):
+            try:
+                res = tg_api("sendMessage", chat_id=chat_id, text=chunk.rstrip("\n"))
+                if res.get("ok"):
+                    break
+                log.warning("Telegram sendMessage: %s", res)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Telegram sendMessage ошибка: %s", e)
+            time.sleep(2)
 
 
-def get_spot_klines(symbol, end_time=None, limit=3):
-    """Свечи спота Binance (нужны только для сверки объёма в команде /check)."""
-    params = {"symbol": symbol, "interval": INTERVAL, "limit": limit}
-    if end_time:
-        params["endTime"] = end_time
-    try:
-        data = requests.get("https://api.binance.com/api/v3/klines", params=params, timeout=10).json()
-        if isinstance(data, list) and len(data) >= 2:
-            return data
-    except Exception:
-        pass
-    return None
-
-
-def candle_open_ms(hhmm):
-    """Время открытия 3-минутной свечи (мс) по времени ЧЧ:ММ в вашем часовом поясе."""
-    tz = timezone(timedelta(hours=LOCAL_UTC_OFFSET))
-    now = datetime.now(tz)
-    h, m = map(int, hhmm.split(":"))
-    t = now.replace(hour=h, minute=m - m % 3, second=0, microsecond=0)
-    if t > now:
-        t -= timedelta(days=1)
-    return int(t.timestamp() * 1000)
-
-
-def closed_only(df):
-    """Оставляет только закрытые свечи: последняя (ещё формирующаяся) отбрасывается."""
-    if df is None or df.empty:
-        return df
-    now_ms = int(time.time() * 1000)
-    if int(df["close_time"].iloc[-1]) > now_ms:
-        return df.iloc[:-1]
-    return df
-
-
-def load_extra_symbols():
-    """USDT-перпетуалы Binance Futures по убыванию объёма торгов за 24ч.
-    Стейблкоины и почти не двигающиеся пары отбрасываются."""
-    try:
-        info = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15).json()
-        tradable = {
-            x["symbol"] for x in info["symbols"]
-            if x.get("status") == "TRADING"
-            and x.get("contractType") == "PERPETUAL"
-            and x.get("quoteAsset") == "USDT"
-        }
-        tickers = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15).json()
-        ranked = []
-        for t in tickers:
-            sym = t["symbol"]
-            if sym not in tradable or sym[:-4] in STABLE_BASES:
-                continue
-            low, high = float(t["lowPrice"]), float(t["highPrice"])
-            if low <= 0 or (high - low) / low * 100 < MIN_DAILY_RANGE_PCT:
-                continue
-            ranked.append((float(t["quoteVolume"]), sym))
-        ranked.sort(reverse=True)
-        return [sym for _, sym in ranked]
-    except Exception as e:
-        print("Ошибка загрузки списка пар:", e)
-        return []
-
-
-def build_symbols():
-    """Ваш список + самые ликвидные волатильные пары до общего числа MAX_PAIRS."""
-    symbols = list(SYMBOLS)
-    if AUTO_ADD_PAIRS:
-        for sym in load_extra_symbols():
-            if len(symbols) >= MAX_PAIRS:
-                break
-            if sym not in symbols:
-                symbols.append(sym)
-    return symbols
-
-
-# === ИНДИКАТОРЫ ===
-def candle_flags(df, mode=AD_MODE):
-    """Для каждой свечи: растёт ли она и падает ли она (два списка True/False)."""
-    if mode == "prev_close":
-        diff = df["close"] - df["close"].shift(1)
-    else:
-        diff = df["close"] - df["open"]
-    return (diff > 0).tolist(), (diff < 0).tolist()
-
-
-def ad_series(df, length=10, mode=AD_MODE):
-    """Advance/Decline Ratio для каждой свечи (начиная с 10-й): растущие / падающие из последних 10.
-    Последний элемент списка - последняя свеча."""
-    ups, downs = candle_flags(df, mode)
+# ----------------------------------------------------------------------------
+# Индикаторы
+# ----------------------------------------------------------------------------
+def parse_closed(raw, now_ms):
+    """Только ЗАКРЫТЫЕ свечи (closeTime уже в прошлом)."""
     out = []
-    for end in range(length - 1, len(df)):
-        up = sum(ups[end - length + 1:end + 1])
-        down = sum(downs[end - length + 1:end + 1])
-        if down == 0:
-            out.append(None)   # деление на ноль: на графике значения нет
-        else:
-            out.append(round(up / down, 2))
+    for k in raw:
+        if int(k[6]) >= now_ms:
+            continue
+        out.append({
+            "t": int(k[0]),
+            "o": float(k[1]),
+            "h": float(k[2]),
+            "l": float(k[3]),
+            "c": float(k[4]),
+            "v": float(k[5]),     # объём в монетах
+            "qv": float(k[7]),    # объём в USDT
+            "tb": float(k[9]),    # taker buy base volume
+        })
     return out
 
 
-def first_drop_at_last(series, level=THRESHOLD):
-    """True, если на ПОСЛЕДНЕЙ свече индикатор впервые пошёл вниз после достижения уровня level или выше.
-
-    Пример: ... 5, 9, 4 -> True (9 достигнут, затем падение).
-            ... 9, 8, 8, 5 -> False (первое падение было на 9 -> 8, это не оно).
-    """
-    reached = False   # уровень достигнут, ждём первого падения
-    locked = False    # первое падение уже было, ждём нового подъёма
-    last = len(series) - 1
-    for i, cur in enumerate(series):
-        prev = series[i - 1] if i > 0 else None
-        triggered = False
-        if cur is None:
-            # значения нет (0 падающих свечей) - линия прерывается, начинаем отсчёт заново
-            reached = False
-            locked = False
-        elif prev is not None and reached and cur < prev:
-            triggered = True
-            reached = False
-            locked = True
-        else:
-            if locked and prev is not None and (cur > prev or cur < level):
-                locked = False
-            if not locked and cur >= level:
-                reached = True
-        if i == last:
-            return triggered
-    return False
+def ad_ratio(candles):
+    """AD = растущие / падающие свечи. Если падающих нет -> бесконечность."""
+    ups = sum(1 for x in candles if x["c"] > x["o"])
+    downs = sum(1 for x in candles if x["c"] < x["o"])
+    if downs == 0:
+        return (math.inf if ups > 0 else 0.0), ups, downs
+    return ups / downs, ups, downs
 
 
-def analyze(df):
-    """Разбирает последнюю свечу в df. Возвращает словарь с результатами или None."""
-    if df is None or len(df) < 12:
+def bop_of(x):
+    rng = x["h"] - x["l"]
+    return (x["c"] - x["o"]) / rng if rng > 0 else 0.0
+
+
+def fmt_ad(v):
+    return "∞" if math.isinf(v) else "%.1f" % v
+
+
+def evaluate(cs):
+    """cs - список закрытых свечей по времени, последняя = сигнальная."""
+    if len(cs) < AD_PERIOD + 2:
         return None
-    series = ad_series(df)
-    if len(series) < 2:
-        return None
-    last = df.iloc[-1]
-    prev_candle = df.iloc[-2]
-    # Дельта объёма свечи: агрессивные покупки минус агрессивные продажи.
-    # Зелёная CVD-свеча = дельта больше нуля.
-    delta = 2 * float(last["taker_buy_quote"]) - float(last["quote_volume"])
-    drop = first_drop_at_last(series)
-    # Индикатор Volume: красный столбец = свеча закрылась ниже открытия,
-    # и объём (в USDT) этой свечи больше объёма предыдущей.
-    vol_red = float(last["close"]) < float(last["open"])
-    vol_last = float(last["quote_volume"])
-    vol_prev = float(prev_candle["quote_volume"])
-    vol_higher = vol_last > vol_prev
+    sig, pre = cs[-1], cs[-2]
+    ad_now, ups, downs = ad_ratio(cs[-AD_PERIOD:])
+    ad_prev, _, _ = ad_ratio(cs[-AD_PERIOD - 1:-1])
+
+    delta = 2.0 * sig["tb"] - sig["v"]          # CVD свечи
+    cond_ad = ad_prev >= AD_THRESHOLD and ad_now < ad_prev
+    cond_cvd = delta > 0
+    cond_vol = sig["c"] < sig["o"] and sig["v"] > pre["v"]
+    bop = bop_of(sig)
+
+    direction = None
+    if cond_ad and cond_cvd and cond_vol:
+        if bop <= BOP_SHORT:
+            direction = "ШОРТ"
+        elif bop > BOP_UP:
+            direction = "ВВЕРХ"
+
     return {
-        "prev": series[-2],
-        "cur": series[-1],
-        "drop": drop,
-        "delta": delta,
-        "vol_red": vol_red,
-        "vol_higher": vol_higher,
-        "vol_last": vol_last,
-        "vol_prev": vol_prev,
-        "signal": drop and delta > 0 and vol_red and vol_higher,
-        "candle": int(last["open_time"]),
+        "t": sig["t"],
+        "close": sig["c"],
+        "ad_now": ad_now, "ups": ups, "downs": downs, "ad_prev": ad_prev,
+        "delta": delta, "vol": sig["v"], "vol_pre": pre["v"],
+        "red": sig["c"] < sig["o"],
+        "bop": bop, "bop_pre": bop_of(pre),
+        "cond_ad": cond_ad, "cond_cvd": cond_cvd, "cond_vol": cond_vol,
+        "direction": direction,
     }
 
 
-def check_symbol(symbol):
-    """Проверяет последнюю закрытую свечу. Возвращает (symbol, info) или (symbol, None)."""
-    return symbol, analyze(closed_only(get_klines(symbol)))
+# ----------------------------------------------------------------------------
+# Список пар
+# ----------------------------------------------------------------------------
+def refresh_pairs():
+    info = binance_get("/fapi/v1/exchangeInfo")
+    ok = {}
+    for s in info["symbols"]:
+        if s.get("contractType") != "PERPETUAL":
+            continue
+        if s.get("quoteAsset") != "USDT" or s.get("status") != "TRADING":
+            continue
+        if s.get("baseAsset", "") in EXCLUDE_BASES:
+            continue
+        ok[s["symbol"]] = True
+
+    tickers = binance_get("/fapi/v1/ticker/24hr")
+    rows = []
+    for t in tickers:
+        sym = t.get("symbol")
+        if sym not in ok or sym in EXTRA_EXCLUDE:
+            continue
+        low, high = float(t["lowPrice"]), float(t["highPrice"])
+        if low <= 0:
+            continue
+        if (high - low) / low * 100.0 < MIN_RANGE_PCT:   # неволатильные
+            continue
+        rows.append((float(t["quoteVolume"]), sym))
+    rows.sort(reverse=True)
+    syms = [s for _, s in rows]
+    if MAX_PAIRS > 0:
+        syms = syms[:MAX_PAIRS]
+    with _lock:
+        STATE["pairs"] = syms
+        STATE["pairs_updated"] = time.time()
+    log.info("Список пар обновлён: %d", len(syms))
+    return syms
 
 
-def candle_string(df, n=10):
-    ups, downs = candle_flags(df, "open")
-    return "".join("▲" if u else "▼" if d else "·" for u, d in zip(ups[-n:], downs[-n:]))
+# ----------------------------------------------------------------------------
+# Один цикл проверки
+# ----------------------------------------------------------------------------
+def check_symbol(sym, now_ms, expected_open):
+    raw = binance_get("/fapi/v1/klines", {"symbol": sym, "interval": INTERVAL, "limit": KLINES_LIMIT})
+    cs = parse_closed(raw, now_ms)
+    if len(cs) < AD_PERIOD + 2:
+        return None
+    if cs[-1]["t"] != expected_open:     # свежей закрытой свечи нет (пара без сделок / задержка)
+        return None
+    return evaluate(cs)
 
 
-def fmt_num(x):
-    return "–" if x is None else f"{x:g}"
+def run_cycle():
+    t0 = time.time()
+    now_ms = int(t0 * 1000)
+    expected_open = (now_ms // INTERVAL_MS) * INTERVAL_MS - INTERVAL_MS
+    with _lock:
+        syms = list(STATE["pairs"])
 
-
-# === МОНИТОРИНГ (работает в фоновом потоке) ===
-def wait_for_candle_close():
-    """Ждёт закрытия ближайшей 3-минутной свечи (+ небольшая задержка)."""
-    now = time.time()
-    next_close = (now // CHECK_INTERVAL + 1) * CHECK_INTERVAL
-    time.sleep(max(next_close - now, 0) + CANDLE_DELAY)
-
-
-def monitor_loop():
-    state["symbols"] = build_symbols()
-    print(f"Бот запущен. Слежу за {len(state['symbols'])} парами на 3м таймфрейме...")
-    send_telegram(f"Бот запущен. Слежу за {len(state['symbols'])} парами")
-
-    alerted = {}   # symbol -> время открытия свечи, по которой уже был алерт
-    cycles = 0
-
-    while True:
+    def worker(sym):
         try:
-            if state["paused"]:
-                time.sleep(5)
+            return sym, check_symbol(sym, now_ms, expected_open), None
+        except Exception as e:  # noqa: BLE001
+            return sym, None, str(e)
+
+    ok = err = 0
+    first_err = None
+    signals = []
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        for sym, res, e in ex.map(worker, syms):
+            if e:
+                err += 1
+                first_err = first_err or e
                 continue
-
-            wait_for_candle_close()
-
-            if state["paused"]:
+            ok += 1
+            if res is None:
                 continue
+            with _lock:
+                STATE["latest"][sym] = res
+                already = STATE["last_sent"].get(sym) == res["t"]
+            if res["direction"] and not already:
+                signals.append((sym, res))
+                with _lock:
+                    STATE["last_sent"][sym] = res["t"]
 
-            cycles += 1
-            if cycles % REFRESH_EVERY == 0:
-                new_symbols = build_symbols()
-                if len(new_symbols) >= len(state["symbols"]) * 0.8:
-                    state["symbols"] = new_symbols
+    if signals:
+        signals.sort(key=lambda x: (x[1]["direction"] != "ШОРТ", x[0]))
+        lines = []
+        for sym, r in signals:
+            if ALERT_DETAILS:
+                lines.append("%s - %s (AD %s→%s, BoP %+.2f)" % (
+                    sym, r["direction"], fmt_ad(r["ad_prev"]), fmt_ad(r["ad_now"]), r["bop"]))
+            else:
+                lines.append("%s - %s" % (sym, r["direction"]))
+        send("\n".join(lines))
+        with _lock:
+            STATE["sent_total"] += len(signals)
 
-            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-                results = list(pool.map(check_symbol, state["symbols"]))
-
-            alerts = []
-            failed = 0
-            for symbol, info in results:
-                if info is None:
-                    failed += 1
-                    continue
-                if info["signal"] and alerted.get(symbol) != info["candle"]:
-                    alerted[symbol] = info["candle"]
-                    alerts.append(symbol)
-
-            if alerts:
-                state["alerts_sent"] += len(alerts)
-                send_long("\n".join(alerts))
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Сигналов: {len(alerts)}")
-
-            state["last_check"] = datetime.now().strftime("%H:%M:%S")
-            print(f"[{state['last_check']}] Проверено {len(results) - failed} из {len(results)} пар.")
-
-        except Exception as e:
-            print("Ошибка в основном цикле:", e)
-            time.sleep(30)
+    dt = time.time() - t0
+    with _lock:
+        STATE["last_cycle_ts"] = time.time()
+        STATE["last_cycle_sec"] = dt
+        STATE["last_cycle_ok"] = ok
+        STATE["last_cycle_err"] = err
+    log.info("Цикл: пар %d, ок %d, ошибок %d, сигналов %d, %.1f c", len(syms), ok, err, len(signals), dt)
+    if syms and err > len(syms) * 0.5 and first_err:
+        send("Предупреждение: в цикле много ошибок (%d из %d). Пример: %s" % (err, len(syms), first_err))
 
 
-# === КОМАНДЫ ===
-HELP_TEXT = (
+# ----------------------------------------------------------------------------
+# Команды Telegram
+# ----------------------------------------------------------------------------
+HELP = (
     "Команды:\n"
     "/status - состояние бота\n"
     "/pairs - список отслеживаемых пар\n"
-    "/check SYMBOL - разбор последней закрытой свечи (AD, CVD, Volume, сигнал)\n"
-    "/check SYMBOL ЧЧ:ММ - разбор свечи за указанное время, например /check BTCUSDT 08:48\n"
-    "/pause - остановить мониторинг\n"
-    "/resume - возобновить мониторинг\n"
-    "/help - эта справка"
-)
+    "/score - пары, у которых сейчас AD >= %g (или /score BTCUSDT - детали по паре)\n"
+    "/pause - приостановить сигналы\n"
+    "/resume - возобновить"
+) % AD_THRESHOLD
 
 
-def handle_command(text, chat_id):
-    parts = text.split()
+def cmd_status():
+    with _lock:
+        paused = STATE["paused"]
+        n = len(STATE["pairs"])
+        last = STATE["last_cycle_ts"]
+        dt = STATE["last_cycle_sec"]
+        ok, err = STATE["last_cycle_ok"], STATE["last_cycle_err"]
+        sent = STATE["sent_total"]
+    ago = ("%d c назад" % (time.time() - last)) if last else "ещё не было"
+    return (
+        "Статус: %s\nПар: %d\nПоследний цикл: %s (%.1f c, ок %d, ошибок %d)\n"
+        "Сигналов отправлено: %d\n"
+        "Правило: AD>=%g и падение, CVD зелёный, объём красный выше предыдущего;\n"
+        "BoP сигнальной <= %g - ШОРТ, > %g - ВВЕРХ"
+    ) % ("ПАУЗА" if paused else "работает", n, ago, dt, ok, err, sent, AD_THRESHOLD, BOP_SHORT, BOP_UP)
+
+
+def cmd_pairs():
+    with _lock:
+        pairs = list(STATE["pairs"])
+    if not pairs:
+        return "Список пар пуст."
+    return "Пар: %d\n%s" % (len(pairs), ", ".join(p.replace("USDT", "") for p in pairs))
+
+
+def cmd_score(arg):
+    with _lock:
+        latest = dict(STATE["latest"])
+    if arg:
+        sym = arg.upper()
+        if not sym.endswith("USDT"):
+            sym += "USDT"
+        r = latest.get(sym)
+        if not r:
+            return "Нет данных по %s (пары нет в списке или ещё не было цикла)." % sym
+        return (
+            "%s (свеча %s UTC)\n"
+            "AD: %s → %s (растущих %d, падающих %d)\n"
+            "CVD свечи: %+.2f %s\n"
+            "Объём: %.2f, предыдущая: %.2f, свеча %s\n"
+            "BoP: %+.2f (предыдущая %+.2f)\n"
+            "Условия: AD %s, CVD %s, Volume %s\n"
+            "Итог: %s"
+        ) % (
+            sym, time.strftime("%d.%m %H:%M", time.gmtime(r["t"] / 1000)),
+            fmt_ad(r["ad_prev"]), fmt_ad(r["ad_now"]), r["ups"], r["downs"],
+            r["delta"], "(зелёный)" if r["delta"] > 0 else "(красный)",
+            r["vol"], r["vol_pre"], "красная" if r["red"] else "зелёная",
+            r["bop"], r["bop_pre"],
+            "да" if r["cond_ad"] else "нет", "да" if r["cond_cvd"] else "нет", "да" if r["cond_vol"] else "нет",
+            r["direction"] or "сигнала нет",
+        )
+    hot = [(s, r) for s, r in latest.items() if r["ad_now"] >= AD_THRESHOLD]
+    hot.sort(key=lambda x: (-(1e9 if math.isinf(x[1]["ad_now"]) else x[1]["ad_now"]), x[0]))
+    if not hot:
+        return "Сейчас нет пар с AD >= %g." % AD_THRESHOLD
+    return "Пары с AD >= %g (по последней закрытой свече):\n%s" % (
+        AD_THRESHOLD,
+        "\n".join("%s: AD %s (%d↑ / %d↓)" % (s, fmt_ad(r["ad_now"]), r["ups"], r["downs"]) for s, r in hot[:60]),
+    )
+
+
+def handle_command(text):
+    parts = text.strip().split()
+    if not parts:
+        return None
     cmd = parts[0].split("@")[0].lower()
-    args = parts[1:]
-
-    if cmd in ("/start", "/help"):
-        send_telegram(
-            "Привет! Я присылаю название пары, когда Advance/Decline Ratio (AD 10) после уровня "
-            f"{THRESHOLD:g}+ впервые идёт вниз, CVD-свеча на этой же свече зелёная, "
-            "а столбец Volume красный и выше предыдущего.\n\n" + HELP_TEXT,
-            chat_id,
-        )
-
-    elif cmd == "/status":
-        status = "на паузе" if state["paused"] else "работает"
-        send_telegram(
-            f"Статус: {status}\n"
-            f"Пар: {len(state['symbols'])}\n"
-            f"Таймфрейм: {INTERVAL}\n"
-            f"Уровень AD: {THRESHOLD:g}\n"
-            f"Последняя проверка: {state['last_check'] or 'ещё не было'}\n"
-            f"Сигналов отправлено: {state['alerts_sent']}",
-            chat_id,
-        )
-
-    elif cmd == "/pairs":
-        send_long(", ".join(state["symbols"]), chat_id)
-
-    elif cmd in ("/check", "/score"):
-        if not args:
-            send_telegram("Укажи пару, например: /check BTCUSDT или /check BTCUSDT 08:48", chat_id)
-            return
-        symbol = args[0].upper()
-        end_time = None
-        if len(args) > 1:
-            try:
-                end_time = candle_open_ms(args[1]) + CHECK_INTERVAL * 1000 - 1
-            except Exception:
-                send_telegram("Время укажи как ЧЧ:ММ, например: /check BTCUSDT 08:48", chat_id)
-                return
-        df = closed_only(get_klines(symbol, end_time=end_time))
-        info = analyze(df)
-        if info is None:
-            send_telegram(f"Не удалось получить данные по {symbol}", chat_id)
-            return
-        tz = timezone(timedelta(hours=LOCAL_UTC_OFFSET))
-        label = datetime.fromtimestamp(info["candle"] / 1000, tz).strftime("%H:%M")
-        spot = get_spot_klines(symbol, end_time=info["candle"] + CHECK_INTERVAL * 1000 - 1)
-        spot_line = ""
-        if spot:
-            sp_last, sp_prev = float(spot[-1][7]), float(spot[-2][7])
-            spot_line = f"Volume спот: {sp_prev:,.0f} → {sp_last:,.0f} USDT ({'выше' if sp_last > sp_prev else 'ниже'})\n"
-        send_telegram(
-            f"{symbol}, свеча {label} (UTC+{LOCAL_UTC_OFFSET})\n"
-            f"AD (бот, режим {AD_MODE}): {fmt_num(info['prev'])} → {fmt_num(info['cur'])}\n"
-            f"AD последние 5 свечей, close>open: {', '.join(fmt_num(v) for v in ad_series(df, mode='open')[-5:])}\n"
-            f"AD последние 5 свечей, к пред. закрытию: {', '.join(fmt_num(v) for v in ad_series(df, mode='prev_close')[-5:])}\n"
-            f"Последние 10 свечей (▲ рост, ▼ падение, · без изменений): {candle_string(df)}\n"
-            f"Первое падение после {THRESHOLD:g}+: {'да' if info['drop'] else 'нет'}\n"
-            f"CVD-свеча: {'зелёная' if info['delta'] > 0 else 'красная'} (дельта {info['delta']:,.0f} USDT)\n"
-            f"Свеча: {'красная' if info['vol_red'] else 'зелёная'}\n"
-            f"Volume фьючерсы: {info['vol_prev']:,.0f} → {info['vol_last']:,.0f} USDT "
-            f"({'выше' if info['vol_higher'] else 'ниже'})\n"
-            f"{spot_line}"
-            f"Сигнал: {'ДА' if info['signal'] else 'нет'}",
-            chat_id,
-        )
-
-    elif cmd == "/pause":
-        state["paused"] = True
-        send_telegram("Мониторинг поставлен на паузу", chat_id)
-
-    elif cmd == "/resume":
-        state["paused"] = False
-        send_telegram("Мониторинг возобновлён", chat_id)
-
-    else:
-        send_telegram("Неизвестная команда. /help - список команд", chat_id)
+    arg = parts[1] if len(parts) > 1 else ""
+    if cmd == "/start":
+        return "Бот запущен.\n\n" + HELP
+    if cmd == "/status":
+        return cmd_status()
+    if cmd == "/pairs":
+        return cmd_pairs()
+    if cmd == "/score":
+        return cmd_score(arg)
+    if cmd == "/pause":
+        with _lock:
+            STATE["paused"] = True
+        return "Сигналы приостановлены."
+    if cmd == "/resume":
+        with _lock:
+            STATE["paused"] = False
+        return "Сигналы возобновлены."
+    return None
 
 
-def commands_loop():
+def poll_commands():
+    try:
+        tg_api("deleteWebhook")
+    except Exception as e:  # noqa: BLE001
+        log.warning("deleteWebhook: %s", e)
     offset = None
     while True:
         try:
-            params = {"timeout": 30}
-            if offset:
+            params = {"timeout": 30, "allowed_updates": json.dumps(["message"])}
+            if offset is not None:
                 params["offset"] = offset
-            r = requests.get(f"{API}/getUpdates", params=params, timeout=40)
-            for upd in r.json().get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message") or {}
-                text = (msg.get("text") or "").strip()
-                chat_id = msg.get("chat", {}).get("id")
-                if not text.startswith("/") or chat_id is None:
+            r = requests.get(
+                "https://api.telegram.org/bot%s/getUpdates" % BOT_TOKEN, params=params, timeout=45
+            ).json()
+            if not r.get("ok"):
+                log.warning("getUpdates: %s", r)
+                time.sleep(5)
+                continue
+            for u in r.get("result", []):
+                offset = u["update_id"] + 1
+                msg = u.get("message")
+                if not msg or "text" not in msg:
                     continue
-                # Бот отвечает только владельцу
-                if chat_id != CHAT_ID:
-                    print("Игнорирую команду от постороннего чата:", chat_id)
+                if str(msg["chat"]["id"]) != CHAT_ID:     # отвечаем только вам
                     continue
-                handle_command(text, chat_id)
-        except Exception as e:
-            print("Ошибка приёма команд:", e)
+                answer = handle_command(msg["text"])
+                if answer:
+                    send(answer, chat_id=str(msg["chat"]["id"]))
+        except Exception as e:  # noqa: BLE001
+            log.warning("poll_commands: %s", e)
             time.sleep(5)
 
 
+# ----------------------------------------------------------------------------
+# Основной цикл
+# ----------------------------------------------------------------------------
+def sleep_until_next_candle():
+    now = time.time()
+    nxt = ((int(now * 1000) // INTERVAL_MS) + 1) * INTERVAL_MS / 1000.0 + CYCLE_DELAY_SEC
+    time.sleep(max(0.0, nxt - now))
+
+
 def main():
-    threading.Thread(target=monitor_loop, daemon=True).start()
-    commands_loop()
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit("Не заданы BOT_TOKEN и/или CHAT_ID")
+    threading.Thread(target=poll_commands, daemon=True).start()
+
+    while True:
+        try:
+            refresh_pairs()
+            break
+        except Exception as e:  # noqa: BLE001
+            log.error("Не удалось получить список пар: %s", e)
+            send("Не удалось получить список пар: %s" % e)
+            time.sleep(60)
+
+    with _lock:
+        n = len(STATE["pairs"])
+    send("Бот запущен. Пар: %d (3m, Binance Futures).\nBoP сигнальной <= %g - ШОРТ, > %g - ВВЕРХ." % (n, BOP_SHORT, BOP_UP))
+
+    while True:
+        sleep_until_next_candle()
+        try:
+            if time.time() - STATE["pairs_updated"] > PAIRS_REFRESH_SEC:
+                try:
+                    refresh_pairs()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Обновление списка пар: %s", e)
+            with _lock:
+                paused = STATE["paused"]
+            if not paused:
+                run_cycle()
+        except Exception as e:  # noqa: BLE001
+            log.exception("Ошибка цикла: %s", e)
 
 
 if __name__ == "__main__":
