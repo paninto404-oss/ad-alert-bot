@@ -1,2 +1,1 @@
-requests
-pandas
+requests>=2.31
