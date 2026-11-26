@@ -4,23 +4,24 @@
 ad_alert.py - Telegram-бот: сигналы по Binance USDT-M Futures, таймфрейм 3m.
 
 Сигнал приходит, когда на только что ЗАКРЫТОЙ 3m-свече (сигнальной) выполнено всё:
-  1. AD 10 (отношение растущих свечей к падающим за 10 свечей) на предыдущей свече
-     было >= 8 (бесконечность тоже считается), а на сигнальной свече упало ниже.
+  1. AD 10 (растущие / падающие свечи за 10 свечей) на предсигнальной свече >= 8,
+     а на сигнальной свече упало ниже. Значение AD = бесконечность (падающих свечей 0)
+     ИГНОРИРУЕТСЯ.
   2. CVD зелёный: дельта сигнальной свечи > 0 (покупки taker - продажи taker).
   3. Volume: сигнальная свеча красная, её объём больше объёма предсигнальной свечи.
-  4. Balance of Power (BoP) сигнальной свечи:
-       BoP <= -0.4  -> в сигнале "ШОРТ"
-       BoP >  -0.1  -> в сигнале "ВВЕРХ"
-       между -0.4 и -0.1 -> сигнал НЕ отправляется
+  4. BoP сигнальной свечи (после округления до 0.01) входит в список BOP_SIGNALS ниже.
      BoP = (close - open) / (high - low)
+
+Сообщение в Telegram: "BTC -" или "ETH +"
+  "+" - движение вверх, "-" - движение вниз (так задано в списке BOP_SIGNALS).
 
 Переменные окружения (Railway -> Variables):
   BOT_TOKEN, CHAT_ID  - обязательные
-  MAX_PAIRS           - сколько пар смотреть (по умолчанию 400, 0 = все подходящие)
+  MAX_PAIRS           - сколько пар смотреть (по умолчанию 600, 0 = все подходящие)
   MIN_RANGE_PCT       - отсев "неволатильных": дневной размах (high-low)/low в %, по умолчанию 1.0
-  EXCLUDE             - доп. исключения через запятую, например "BTCDOMUSDT,USDCUSDT"
-  AD_THRESHOLD, BOP_SHORT, BOP_UP, AD_PERIOD - пороги (8, -0.4, -0.1, 10)
-  ALERT_DETAILS       - 1: добавлять в сигнал значения AD и BoP (по умолчанию 0: только пара и направление)
+  EXCLUDE             - доп. исключения через запятую, например "BTCDOMUSDT,XYZUSDT"
+  AD_THRESHOLD        - порог AD (по умолчанию 8), AD_PERIOD (по умолчанию 10)
+  ALERT_DETAILS       - 1: добавлять в сигнал значения AD и BoP (по умолчанию 0)
   BINANCE_URL         - по умолчанию https://fapi.binance.com
 """
 
@@ -35,6 +36,29 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 # ----------------------------------------------------------------------------
+# Значения BoP сигнальной свечи, при которых приходит сигнал, и направление.
+# Ключ - BoP, округлённый до 0.01. "+" вверх, "-" вниз.
+# ----------------------------------------------------------------------------
+BOP_SIGNALS = {
+    "-0.01": "+",
+    "-0.02": "+",
+    "-0.09": "+",
+    "-0.11": "+",
+    "-0.15": "-",
+    "-0.19": "-",
+    "-0.28": "+",
+    "-0.29": "+",
+    "-0.31": "+",
+    "-0.35": "+",
+    "-0.36": "-",
+    "-0.46": "+",
+    "-0.57": "+",
+    "-0.72": "-",
+    "-0.73": "+",
+    "-0.88": "-",
+}
+
+# ----------------------------------------------------------------------------
 # Настройки
 # ----------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -46,24 +70,23 @@ INTERVAL_MS = 180_000
 
 AD_PERIOD = int(os.environ.get("AD_PERIOD", "10"))
 AD_THRESHOLD = float(os.environ.get("AD_THRESHOLD", "8"))
-BOP_SHORT = float(os.environ.get("BOP_SHORT", "-0.4"))
-BOP_UP = float(os.environ.get("BOP_UP", "-0.1"))
 
-MAX_PAIRS = int(os.environ.get("MAX_PAIRS", "400"))
+MAX_PAIRS = int(os.environ.get("MAX_PAIRS", "600"))
 MIN_RANGE_PCT = float(os.environ.get("MIN_RANGE_PCT", "1.0"))
 PAIRS_REFRESH_SEC = int(os.environ.get("PAIRS_REFRESH_SEC", str(6 * 3600)))
-WORKERS = int(os.environ.get("WORKERS", "16"))
+WORKERS = int(os.environ.get("WORKERS", "20"))
 CYCLE_DELAY_SEC = float(os.environ.get("CYCLE_DELAY_SEC", "4"))
 ALERT_DETAILS = os.environ.get("ALERT_DETAILS", "0") == "1"
 
 # Нужно AD_PERIOD+1 закрытых свечей (AD на предсигнальной и на сигнальной) + запас.
-# limit < 100 у Binance = вес запроса 1.
+# limit < 100 у Binance = вес запроса 1 (600 пар = 600 веса за цикл, лимит 2400/мин).
 KLINES_LIMIT = AD_PERIOD + 6
 
-# Стейблы и подобное: не волатильные, отсекаем по базовому активу.
+# Стейблы, фиат и подобное: не волатильные, отсекаем по базовому активу.
 EXCLUDE_BASES = {
-    "USDC", "FDUSD", "TUSD", "BUSD", "USDP", "DAI", "USDE", "EUR", "AEUR",
-    "XUSD", "USD1", "RLUSD", "USDS", "PYUSD", "UST", "USTC",
+    "USDC", "FDUSD", "TUSD", "BUSD", "USDP", "DAI", "USDE", "EUR", "AEUR", "EURI",
+    "XUSD", "USD1", "RLUSD", "USDS", "PYUSD", "UST", "USTC", "GUSD", "USDD", "FRAX",
+    "LUSD", "SUSD", "BFUSD", "AUSD", "USDX", "CUSD", "ZUSD", "USDG", "USDT",
 }
 EXTRA_EXCLUDE = {s.strip().upper() for s in os.environ.get("EXCLUDE", "").split(",") if s.strip()}
 
@@ -79,6 +102,7 @@ log = logging.getLogger("ad_alert")
 _lock = threading.Lock()
 STATE = {
     "pairs": [],
+    "base": {},          # symbol -> базовый актив (для текста сигнала)
     "pairs_updated": 0.0,
     "paused": False,
     "last_cycle_ts": 0.0,
@@ -86,8 +110,8 @@ STATE = {
     "last_cycle_ok": 0,
     "last_cycle_err": 0,
     "sent_total": 0,
-    "latest": {},       # symbol -> результат evaluate() по последней закрытой свече
-    "last_sent": {},    # symbol -> open_time сигнальной свечи, по которой уже слали
+    "latest": {},        # symbol -> результат evaluate() по последней закрытой свече
+    "last_sent": {},     # symbol -> open_time сигнальной свечи, по которой уже слали
 }
 
 _tls = threading.local()
@@ -172,7 +196,6 @@ def parse_closed(raw, now_ms):
             "l": float(k[3]),
             "c": float(k[4]),
             "v": float(k[5]),     # объём в монетах
-            "qv": float(k[7]),    # объём в USDT
             "tb": float(k[9]),    # taker buy base volume
         })
     return out
@@ -192,6 +215,14 @@ def bop_of(x):
     return (x["c"] - x["o"]) / rng if rng > 0 else 0.0
 
 
+def bop_key(bop):
+    """BoP, округлённый до 0.01, как строка ('-0.46'). '-0.00' приводим к '0.00'."""
+    r = round(bop, 2) + 0.0
+    if r == 0:
+        r = 0.0
+    return "%.2f" % r
+
+
 def fmt_ad(v):
     return "∞" if math.isinf(v) else "%.1f" % v
 
@@ -205,26 +236,26 @@ def evaluate(cs):
     ad_prev, _, _ = ad_ratio(cs[-AD_PERIOD - 1:-1])
 
     delta = 2.0 * sig["tb"] - sig["v"]          # CVD свечи
-    cond_ad = ad_prev >= AD_THRESHOLD and ad_now < ad_prev
+    ad_inf = math.isinf(ad_prev)                # AD = бесконечность игнорируем
+    cond_ad = (not ad_inf) and ad_prev >= AD_THRESHOLD and ad_now < ad_prev
     cond_cvd = delta > 0
     cond_vol = sig["c"] < sig["o"] and sig["v"] > pre["v"]
     bop = bop_of(sig)
+    key = bop_key(bop)
+    cond_bop = key in BOP_SIGNALS
 
     direction = None
-    if cond_ad and cond_cvd and cond_vol:
-        if bop <= BOP_SHORT:
-            direction = "ШОРТ"
-        elif bop > BOP_UP:
-            direction = "ВВЕРХ"
+    if cond_ad and cond_cvd and cond_vol and cond_bop:
+        direction = BOP_SIGNALS[key]
 
     return {
         "t": sig["t"],
         "close": sig["c"],
-        "ad_now": ad_now, "ups": ups, "downs": downs, "ad_prev": ad_prev,
+        "ad_now": ad_now, "ups": ups, "downs": downs, "ad_prev": ad_prev, "ad_inf": ad_inf,
         "delta": delta, "vol": sig["v"], "vol_pre": pre["v"],
         "red": sig["c"] < sig["o"],
-        "bop": bop, "bop_pre": bop_of(pre),
-        "cond_ad": cond_ad, "cond_cvd": cond_cvd, "cond_vol": cond_vol,
+        "bop": bop, "bop_key": key,
+        "cond_ad": cond_ad, "cond_cvd": cond_cvd, "cond_vol": cond_vol, "cond_bop": cond_bop,
         "direction": direction,
     }
 
@@ -240,9 +271,10 @@ def refresh_pairs():
             continue
         if s.get("quoteAsset") != "USDT" or s.get("status") != "TRADING":
             continue
-        if s.get("baseAsset", "") in EXCLUDE_BASES:
+        base = s.get("baseAsset", "")
+        if base.upper() in EXCLUDE_BASES:
             continue
-        ok[s["symbol"]] = True
+        ok[s["symbol"]] = base
 
     tickers = binance_get("/fapi/v1/ticker/24hr")
     rows = []
@@ -262,6 +294,7 @@ def refresh_pairs():
         syms = syms[:MAX_PAIRS]
     with _lock:
         STATE["pairs"] = syms
+        STATE["base"] = {s: ok[s] for s in syms}
         STATE["pairs_updated"] = time.time()
     log.info("Список пар обновлён: %d", len(syms))
     return syms
@@ -286,6 +319,7 @@ def run_cycle():
     expected_open = (now_ms // INTERVAL_MS) * INTERVAL_MS - INTERVAL_MS
     with _lock:
         syms = list(STATE["pairs"])
+        base = dict(STATE["base"])
 
     def worker(sym):
         try:
@@ -314,14 +348,15 @@ def run_cycle():
                     STATE["last_sent"][sym] = res["t"]
 
     if signals:
-        signals.sort(key=lambda x: (x[1]["direction"] != "ШОРТ", x[0]))
+        signals.sort(key=lambda x: x[0])
         lines = []
         for sym, r in signals:
+            name = base.get(sym) or sym.replace("USDT", "")
             if ALERT_DETAILS:
-                lines.append("%s - %s (AD %s→%s, BoP %+.2f)" % (
-                    sym, r["direction"], fmt_ad(r["ad_prev"]), fmt_ad(r["ad_now"]), r["bop"]))
+                lines.append("%s %s (AD %s→%s, BoP %s)" % (
+                    name, r["direction"], fmt_ad(r["ad_prev"]), fmt_ad(r["ad_now"]), r["bop_key"]))
             else:
-                lines.append("%s - %s" % (sym, r["direction"]))
+                lines.append("%s %s" % (name, r["direction"]))
         send("\n".join(lines))
         with _lock:
             STATE["sent_total"] += len(signals)
@@ -344,10 +379,23 @@ HELP = (
     "Команды:\n"
     "/status - состояние бота\n"
     "/pairs - список отслеживаемых пар\n"
+    "/rules - условия сигнала и список значений BoP\n"
     "/score - пары, у которых сейчас AD >= %g (или /score BTCUSDT - детали по паре)\n"
     "/pause - приостановить сигналы\n"
     "/resume - возобновить"
 ) % AD_THRESHOLD
+
+
+def cmd_rules():
+    bop = ", ".join("%s %s" % (k, v) for k, v in BOP_SIGNALS.items())
+    return (
+        "Сигнал, когда на сигнальной свече (3m):\n"
+        "1) AD был >= %g (бесконечность игнорируется) и упал ниже\n"
+        "2) CVD зелёный\n"
+        "3) объём красный и выше предыдущего\n"
+        "4) BoP (округление до 0.01) из списка:\n%s\n"
+        "Формат сигнала: ТИКЕР + (вверх) или ТИКЕР - (вниз)"
+    ) % (AD_THRESHOLD, bop)
 
 
 def cmd_status():
@@ -362,9 +410,8 @@ def cmd_status():
     return (
         "Статус: %s\nПар: %d\nПоследний цикл: %s (%.1f c, ок %d, ошибок %d)\n"
         "Сигналов отправлено: %d\n"
-        "Правило: AD>=%g и падение, CVD зелёный, объём красный выше предыдущего;\n"
-        "BoP сигнальной <= %g - ШОРТ, > %g - ВВЕРХ"
-    ) % ("ПАУЗА" if paused else "работает", n, ago, dt, ok, err, sent, AD_THRESHOLD, BOP_SHORT, BOP_UP)
+        "Правило: AD>=%g и падение (AD ∞ игнор), CVD зелёный, объём красный выше предыдущего, BoP из списка (/rules)"
+    ) % ("ПАУЗА" if paused else "работает", n, ago, dt, ok, err, sent, AD_THRESHOLD)
 
 
 def cmd_pairs():
@@ -387,25 +434,27 @@ def cmd_score(arg):
             return "Нет данных по %s (пары нет в списке или ещё не было цикла)." % sym
         return (
             "%s (свеча %s UTC)\n"
-            "AD: %s → %s (растущих %d, падающих %d)\n"
+            "AD: %s → %s (растущих %d, падающих %d)%s\n"
             "CVD свечи: %+.2f %s\n"
             "Объём: %.2f, предыдущая: %.2f, свеча %s\n"
-            "BoP: %+.2f (предыдущая %+.2f)\n"
-            "Условия: AD %s, CVD %s, Volume %s\n"
+            "BoP: %s %s\n"
+            "Условия: AD %s, CVD %s, Volume %s, BoP %s\n"
             "Итог: %s"
         ) % (
             sym, time.strftime("%d.%m %H:%M", time.gmtime(r["t"] / 1000)),
             fmt_ad(r["ad_prev"]), fmt_ad(r["ad_now"]), r["ups"], r["downs"],
+            "  [AD ∞ - игнор]" if r["ad_inf"] else "",
             r["delta"], "(зелёный)" if r["delta"] > 0 else "(красный)",
             r["vol"], r["vol_pre"], "красная" if r["red"] else "зелёная",
-            r["bop"], r["bop_pre"],
-            "да" if r["cond_ad"] else "нет", "да" if r["cond_cvd"] else "нет", "да" if r["cond_vol"] else "нет",
-            r["direction"] or "сигнала нет",
+            r["bop_key"], ("(в списке: %s)" % BOP_SIGNALS[r["bop_key"]]) if r["cond_bop"] else "(нет в списке)",
+            "да" if r["cond_ad"] else "нет", "да" if r["cond_cvd"] else "нет",
+            "да" if r["cond_vol"] else "нет", "да" if r["cond_bop"] else "нет",
+            ("%s %s" % (sym.replace("USDT", ""), r["direction"])) if r["direction"] else "сигнала нет",
         )
-    hot = [(s, r) for s, r in latest.items() if r["ad_now"] >= AD_THRESHOLD]
-    hot.sort(key=lambda x: (-(1e9 if math.isinf(x[1]["ad_now"]) else x[1]["ad_now"]), x[0]))
+    hot = [(s, r) for s, r in latest.items() if (not r["ad_inf"]) and r["ad_now"] >= AD_THRESHOLD]
+    hot.sort(key=lambda x: (-x[1]["ad_now"], x[0]))
     if not hot:
-        return "Сейчас нет пар с AD >= %g." % AD_THRESHOLD
+        return "Сейчас нет пар с AD >= %g (AD ∞ не считается)." % AD_THRESHOLD
     return "Пары с AD >= %g (по последней закрытой свече):\n%s" % (
         AD_THRESHOLD,
         "\n".join("%s: AD %s (%d↑ / %d↓)" % (s, fmt_ad(r["ad_now"]), r["ups"], r["downs"]) for s, r in hot[:60]),
@@ -424,6 +473,8 @@ def handle_command(text):
         return cmd_status()
     if cmd == "/pairs":
         return cmd_pairs()
+    if cmd == "/rules":
+        return cmd_rules()
     if cmd == "/score":
         return cmd_score(arg)
     if cmd == "/pause":
@@ -495,7 +546,7 @@ def main():
 
     with _lock:
         n = len(STATE["pairs"])
-    send("Бот запущен. Пар: %d (3m, Binance Futures).\nBoP сигнальной <= %g - ШОРТ, > %g - ВВЕРХ." % (n, BOP_SHORT, BOP_UP))
+    send("Бот запущен (версия BoP-список). Пар: %d (3m, Binance Futures).\nСписок условий: /rules" % n)
 
     while True:
         sleep_until_next_candle()
