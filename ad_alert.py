@@ -586,7 +586,7 @@ def main():
     with _lock:
         n = len(STATE["pairs"])
         elig = STATE["eligible"]
-    send("Бот запущен (версия BoP 3% / 4.4%). Пар: %d из %d подходящих (MAX_PAIRS=%d), 3m, Binance Futures.\nСписок условий: /rules" % (n, elig, MAX_PAIRS))
+    send("Бот запущен (версия BoP 3%% / 4.4%%). Пар: %d из %d подходящих (MAX_PAIRS=%d), 3m, Binance Futures.\nСписок условий: /rules" % (n, elig, MAX_PAIRS))
 
     while True:
         sleep_until_next_candle()
